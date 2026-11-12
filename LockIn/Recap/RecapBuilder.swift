@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 import UIKit
 
@@ -18,7 +19,8 @@ enum RecapBuilder {
             videoSize = info.size
         }
 
-        if let cover = render(CoverView(session: session, background: background, streak: streak), opaque: true),
+        let blurred = background.flatMap { blur($0, radius: 45) }
+        if let cover = render(CoverView(session: session, background: background, blurredBackground: blurred, streak: streak), opaque: true),
            let data = cover.jpegData(compressionQuality: 0.92) {
             if (try? data.write(to: folder.appendingPathComponent("cover.jpg"))) != nil {
                 result.coverFile = "cover.jpg"
@@ -49,6 +51,16 @@ enum RecapBuilder {
             }
         }
         return result
+    }
+
+    private static func blur(_ image: UIImage, radius: Float) -> UIImage? {
+        guard let input = CIImage(image: image) else { return nil }
+        let filter = CIFilter.gaussianBlur()
+        filter.inputImage = input.clampedToExtent()
+        filter.radius = radius
+        guard let output = filter.outputImage?.cropped(to: input.extent),
+              let cgImage = CIContext().createCGImage(output, from: input.extent) else { return nil }
+        return UIImage(cgImage: cgImage)
     }
 
     private static func render<V: View>(_ view: V, opaque: Bool) -> UIImage? {

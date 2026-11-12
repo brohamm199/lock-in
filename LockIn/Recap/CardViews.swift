@@ -93,86 +93,114 @@ struct ProfileShape: Shape {
     }
 }
 
-// MARK: - Cover (1080×1920 story image)
+// MARK: - Cover (1080×1920 story image, "Glass" style)
 
+/// Full-bleed timelapse photo with a frosted stats card at the bottom.
+/// `blurredBackground` is the same photo pre-blurred, since ImageRenderer can't draw live materials.
 struct CoverView: View {
     let session: FocusSession
     let background: UIImage?
+    let blurredBackground: UIImage?
     let streak: Int
+
+    private let width: CGFloat = 360
+    private let height: CGFloat = 640
+    private let inset: CGFloat = 14
+    private let cardHeight: CGFloat = 236
+    private let cardRadius: CGFloat = 24
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            backdrop
-            LinearGradient(
-                stops: [
-                    .init(color: .black.opacity(0.5), location: 0),
-                    .init(color: .clear, location: 0.18),
-                    .init(color: .clear, location: 0.38),
-                    .init(color: .black.opacity(0.85), location: 0.68),
-                    .init(color: .black.opacity(0.95), location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline) {
-                    BrandMark(size: 14)
-                    Spacer()
-                    Text(Fmt.dateTime.string(from: session.startDate))
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.8))
-                }
+            photo(background)
+
+            // Keeps the brand mark readable on bright photos.
+            LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
+                .frame(width: width, height: 120)
+
+            HStack(alignment: .firstTextBaseline) {
+                BrandMark(size: 14)
                 Spacer()
-                Text(session.title)
-                    .font(.system(size: 30, weight: .heavy))
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.6)
-                    .padding(.bottom, 18)
-                HStack(alignment: .top, spacing: 26) {
-                    StatBlock(label: "Time", value: Fmt.duration(session.duration))
-                    StatBlock(label: "Focus", value: "\(session.focusScore)%")
-                    StatBlock(label: "Pickups", value: "\(session.pickups)")
+                if streak > 0 {
+                    Label("\(streak)", systemImage: "flame.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.18), in: Capsule())
                 }
-                Text("FOCUS PROFILE")
-                    .font(.system(size: 9, weight: .semibold))
-                    .tracking(1)
-                    .foregroundStyle(.white.opacity(0.55))
-                    .padding(.top, 20)
-                    .padding(.bottom, 6)
-                FocusProfileView(values: session.focusProfile(buckets: 40))
-                    .frame(height: 64)
-                HStack(spacing: 6) {
-                    if streak > 0 {
-                        Image(systemName: "flame.fill").foregroundStyle(Theme.accent)
-                        Text("\(streak) day streak")
-                    }
-                    Spacer()
-                    Text("\(Fmt.duration(session.focusedTime)) focused")
-                }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.85))
-                .padding(.top, 14)
             }
-            .padding(24)
+            .padding(.horizontal, 20)
+            .padding(.top, 22)
+            .frame(width: width)
+
+            glassCard
+                .frame(width: width - inset * 2, height: cardHeight)
+                .offset(x: inset, y: height - inset - cardHeight)
         }
-        .frame(width: 360, height: 640)
+        .frame(width: width, height: height)
         .clipped()
     }
 
+    private var glassCard: some View {
+        let shape = RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+        return ZStack(alignment: .topLeading) {
+            // Frosted glass: the blurred photo, lined up with the sharp one behind it.
+            photo(blurredBackground ?? background)
+                .offset(x: -inset, y: -(height - inset - cardHeight))
+                .frame(width: width - inset * 2, height: cardHeight, alignment: .topLeading)
+                .clipped()
+            Color.black.opacity(0.22)
+            Color.white.opacity(0.10)
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text(session.title)
+                    .font(.system(size: 22, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                Text(Fmt.dateTime.string(from: session.startDate))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.top, 2)
+
+                HStack(alignment: .top) {
+                    StatBlock(label: "Time", value: Fmt.duration(session.duration), valueSize: 24)
+                    Spacer()
+                    StatBlock(label: "Focus", value: "\(session.focusScore)%", valueSize: 24)
+                    Spacer()
+                    StatBlock(label: "Pickups", value: "\(session.pickups)", valueSize: 24)
+                }
+                .padding(.top, 16)
+
+                FocusProfileView(values: session.focusProfile(buckets: 40))
+                    .frame(height: 46)
+                    .padding(.top, 14)
+
+                Spacer(minLength: 0)
+                Text("\(Fmt.duration(session.focusedTime)) focused")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+            .padding(18)
+        }
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.white.opacity(0.35), lineWidth: 0.75))
+    }
+
     @ViewBuilder
-    private var backdrop: some View {
-        if let background {
-            Image(uiImage: background)
+    private func photo(_ image: UIImage?) -> some View {
+        if let image {
+            Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
-                .frame(width: 360, height: 640)
+                .frame(width: width, height: height)
                 .clipped()
         } else {
             ZStack {
-                Color(white: 0.05)
-                RadialGradient(colors: [Theme.accent.opacity(0.55), .clear], center: .topTrailing, startRadius: 10, endRadius: 420)
+                Color(white: 0.06)
+                RadialGradient(colors: [Theme.accent.opacity(0.5), .clear], center: .topTrailing, startRadius: 10, endRadius: 420)
             }
+            .frame(width: width, height: height)
         }
     }
 }

@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# A newer push cancels any older build still queued or running.
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15-intel
