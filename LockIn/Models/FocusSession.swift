@@ -29,6 +29,10 @@ struct FocusSession: Codable, Identifiable, Hashable {
     var coverFile: String?
     var stickerFile: String?
     var thumbFile: String?
+    /// Position in the timelapse (seconds) to use as the cover photo. nil = middle of the video.
+    var coverFrameTime: Double?
+    /// Streak at the moment the session ended, so rebuilding a recap later shows the same number.
+    var streakAtEnd: Int?
 
     var duration: TimeInterval { max(0, endDate.timeIntervalSince(startDate)) }
     var distractedTime: TimeInterval { min(duration, distractions.reduce(0) { $0 + $1.length }) }

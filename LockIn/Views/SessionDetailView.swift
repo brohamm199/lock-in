@@ -25,6 +25,9 @@ struct SessionDetailView: View {
     @State private var player: AVPlayer?
     @State private var rebuilding = false
     @State private var confirmDelete = false
+    @State private var renaming = false
+    @State private var draftTitle = ""
+    @State private var pickingFrame = false
 
     var body: some View {
         Group {
@@ -50,18 +53,26 @@ struct SessionDetailView: View {
                 preview(session)
                     .frame(maxWidth: .infinity)
 
+                HStack(spacing: 10) {
+                    ShareButton(title: "Rename", icon: "pencil") {
+                        draftTitle = session.title
+                        renaming = true
+                    }
+                    if session.rawVideoURL != nil {
+                        ShareButton(title: "Cover frame", icon: "photo.on.rectangle") {
+                            pickingFrame = true
+                        }
+                    }
+                }
+                .disabled(rebuilding)
+
                 shareButtons(session)
 
                 StatsGrid(session: session)
 
                 if session.coverFile == nil || (session.rawVideoFile != nil && session.shareVideoFile == nil) {
                     Button {
-                        Task {
-                            rebuilding = true
-                            let updated = await RecapBuilder.build(for: session, streak: store.streak)
-                            store.upsert(updated)
-                            rebuilding = false
-                        }
+                        rebuild(session, includeVideo: true)
                     } label: {
                         HStack {
                             if rebuilding { ProgressView() }
@@ -100,8 +111,60 @@ struct SessionDetailView: View {
             ShareSheet(items: item.urls)
                 .ignoresSafeArea()
         }
+        .sheet(isPresented: $pickingFrame) {
+            if let url = session.rawVideoURL {
+                CoverFramePicker(videoURL: url, session: session) { time in
+                    var updated = session
+                    updated.coverFrameTime = time
+                    store.upsert(updated)
+                    tab = .cover
+                    rebuild(updated, includeVideo: false)
+                }
+            }
+        }
+        .alert("Rename session", isPresented: $renaming) {
+            TextField("Session name", text: $draftTitle)
+            Button("Save") {
+                let name = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty, name != session.title else { return }
+                var updated = session
+                updated.title = name
+                store.upsert(updated)
+                // The name is on the cover, sticker and video, so redo all three.
+                rebuild(updated, includeVideo: true)
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .overlay {
+            if rebuilding {
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.large).tint(Theme.accent)
+                    Text("Updating your recap…").font(.subheadline.weight(.semibold))
+                }
+                .padding(28)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+            }
+        }
         .onChange(of: tab) { _, newTab in
             if newTab != .video { player?.pause() }
+        }
+    }
+
+    private func rebuild(_ session: FocusSession, includeVideo: Bool) {
+        guard !rebuilding else { return }
+        rebuilding = true
+        if includeVideo {
+            // Release the old file before it gets overwritten.
+            player?.pause()
+            player = nil
+        }
+        Task {
+            let updated = await RecapBuilder.build(for: session, streak: store.streak, includeVideo: includeVideo)
+            store.upsert(updated)
+            if includeVideo, let url = updated.shareVideoURL ?? updated.rawVideoURL {
+                player = AVPlayer(url: url)
+            }
+            rebuilding = false
         }
     }
 

@@ -107,6 +107,7 @@ final class SessionController: ObservableObject {
             rawVideoFile: result.url?.lastPathComponent
         )
         store.upsert(session)
+        session.streakAtEnd = store.streak
         session = await RecapBuilder.build(for: session, streak: store.streak)
         store.upsert(session)
         phase = .done(session)

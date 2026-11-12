@@ -5,13 +5,15 @@ import UIKit
 /// Makes everything you share after a session: the cover, the sticker, and the timelapse with stats on it.
 @MainActor
 enum RecapBuilder {
-    static func build(for session: FocusSession, streak: Int) async -> FocusSession {
+    /// Pass `includeVideo: false` to only redo the images (much faster, e.g. after picking a new cover frame).
+    static func build(for session: FocusSession, streak currentStreak: Int, includeVideo: Bool = true) async -> FocusSession {
         var result = session
         let folder = Storage.folder(for: session.id)
+        let streak = session.streakAtEnd ?? currentStreak
 
         var background: UIImage?
         var videoSize = CGSize(width: 1080, height: 1920)
-        if let raw = session.rawVideoURL, let info = await VideoTools.inspect(raw) {
+        if let raw = session.rawVideoURL, let info = await VideoTools.inspect(raw, frameAt: session.coverFrameTime) {
             background = info.thumbnail.map { UIImage(cgImage: $0) }
             videoSize = info.size
         }
@@ -37,7 +39,7 @@ enum RecapBuilder {
             result.stickerFile = "sticker.png"
         }
 
-        if let raw = session.rawVideoURL {
+        if includeVideo, let raw = session.rawVideoURL {
             let points = CGSize(width: videoSize.width / 3, height: videoSize.height / 3)
             if let overlay = render(VideoOverlayView(session: session, size: points, streak: streak), opaque: false) {
                 let output = folder.appendingPathComponent("share.mp4")
@@ -63,7 +65,7 @@ enum VideoTools {
         let thumbnail: CGImage?
     }
 
-    static func inspect(_ url: URL) async -> Info? {
+    static func inspect(_ url: URL, frameAt frameTime: Double? = nil) async -> Info? {
         let asset = AVURLAsset(url: url)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let props = try? await track.load(.naturalSize, .preferredTransform),
@@ -73,8 +75,11 @@ enum VideoTools {
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        let middle = CMTime(seconds: CMTimeGetSeconds(duration) * 0.5, preferredTimescale: 600)
-        let thumbnail = try? await generator.image(at: middle).image
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let total = CMTimeGetSeconds(duration)
+        let seconds = min(max(frameTime ?? total * 0.5, 0), max(total - 0.01, 0))
+        let thumbnail = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
         return Info(size: size, thumbnail: thumbnail)
     }
 
