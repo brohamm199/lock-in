@@ -108,6 +108,7 @@ final class SessionController: ObservableObject {
         )
         store.upsert(session)
         session.streakAtEnd = store.streak
+        session.coverTemplate = CoverTemplate.lastUsed.rawValue
         session = await RecapBuilder.build(for: session, streak: store.streak)
         store.upsert(session)
         phase = .done(session)

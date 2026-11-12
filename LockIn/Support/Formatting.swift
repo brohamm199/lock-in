@@ -24,15 +24,24 @@ enum Fmt {
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%02d:%02d", m, sec)
     }
 
-    static let dateTime: DateFormatter = {
-        let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate("EEE MMM d jmm")
-        return f
-    }()
+    /// ["2H", "14M"] or ["14M", "5S"], for big stacked type.
+    static func bigParts(_ t: TimeInterval) -> [String] {
+        let s = max(0, Int(t.rounded()))
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? ["\(h)H", "\(m)M"] : ["\(m)M", "\(sec)S"]
+    }
 
-    static let weekdayLetter: DateFormatter = {
+    private static func formatter(_ template: String) -> DateFormatter {
         let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate("EEEEE")
+        f.setLocalizedDateFormatFromTemplate(template)
         return f
-    }()
+    }
+
+    static let dateTime = formatter("EEE MMM d jmm")
+    static let weekdayLetter = formatter("EEEEE")
+    static let weekday = formatter("EEEE")
+    static let shortDate = formatter("MMM d")
+    static let month = formatter("MMMM")
+    static let dayNumber = formatter("d")
+    static let timeOnly = formatter("jmm")
 }

@@ -9,11 +9,17 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
     let session = AVCaptureSession()
     @Published private(set) var position: AVCaptureDevice.Position = .front
     @Published private(set) var permissionDenied = false
+    /// Zoom buttons to show, in "camera app" terms (0.5×, 1×, 2×, 3×).
+    @Published private(set) var zoomPresets: [CGFloat] = [1]
+    @Published private(set) var displayZoom: CGFloat = 1
 
     private let sessionQueue = DispatchQueue(label: "lockin.camera.session")
     private let frameQueue = DispatchQueue(label: "lockin.camera.frames")
     private let videoOutput = AVCaptureVideoDataOutput()
     private var input: AVCaptureDeviceInput?
+    // Only touched on sessionQueue. zoomBase is the device zoom factor that counts as "1×".
+    private var zoomBase: CGFloat = 1
+    private var maxZoomFactor: CGFloat = 1
 
     // Only touched on frameQueue.
     private var recording = false
@@ -83,11 +89,12 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
             session.removeInput(input)
             self.input = nil
         }
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+        guard let device = Self.captureDevice(for: position),
               let newInput = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(newInput) else { return }
         session.addInput(newInput)
         input = newInput
+        configureZoom(device)
 
         if !session.outputs.contains(videoOutput), session.canAddOutput(videoOutput) {
             videoOutput.videoSettings = [
@@ -100,6 +107,70 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
         // Portrait frames, ready for Instagram stories.
         if let connection = videoOutput.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
+        }
+    }
+
+    // MARK: Zoom
+
+    /// Back camera: the virtual triple camera, so zooming switches between ultra wide, wide and telephoto.
+    private static func captureDevice(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+        let types: [AVCaptureDevice.DeviceType] = position == .back
+            ? [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera]
+            : [.builtInWideAngleCamera]
+        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: position)
+        for type in types {
+            if let device = discovery.devices.first(where: { $0.deviceType == type }) {
+                return device
+            }
+        }
+        return nil
+    }
+
+    private func configureZoom(_ device: AVCaptureDevice) {
+        let switchOvers = device.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat($0.doubleValue) }
+        let startsUltraWide = device.deviceType == .builtInTripleCamera || device.deviceType == .builtInDualWideCamera
+        let base: CGFloat = startsUltraWide ? (switchOvers.first ?? 1) : 1
+        let minFactor = device.minAvailableVideoZoomFactor
+        let maxFactor = min(device.maxAvailableVideoZoomFactor, base * 10)
+
+        var presets: Set<CGFloat> = [1]
+        if minFactor / base < 0.99 {
+            presets.insert((minFactor / base * 10).rounded() / 10)
+        }
+        for factor in switchOvers where factor / base > 1.01 {
+            presets.insert((factor / base * 10).rounded() / 10)
+        }
+        if maxFactor / base >= 2 {
+            presets.insert(2)
+        }
+        let sortedPresets = presets.filter { $0 * base <= maxFactor + 0.01 }.sorted()
+
+        zoomBase = base
+        maxZoomFactor = maxFactor
+        if (try? device.lockForConfiguration()) != nil {
+            device.videoZoomFactor = min(max(base, minFactor), maxFactor)
+            device.unlockForConfiguration()
+        }
+        DispatchQueue.main.async {
+            self.zoomPresets = sortedPresets
+            self.displayZoom = 1
+        }
+    }
+
+    /// `display` is in camera-app terms: 0.5 = ultra wide, 1 = main lens, 3 = telephoto.
+    func setZoom(_ display: CGFloat, animated: Bool) {
+        sessionQueue.async {
+            guard let device = self.input?.device else { return }
+            let factor = min(max(display * self.zoomBase, device.minAvailableVideoZoomFactor), self.maxZoomFactor)
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            if animated {
+                device.ramp(toVideoZoomFactor: factor, withRate: 12)
+            } else {
+                device.videoZoomFactor = factor
+            }
+            device.unlockForConfiguration()
+            let shown = factor / self.zoomBase
+            DispatchQueue.main.async { self.displayZoom = shown }
         }
     }
 

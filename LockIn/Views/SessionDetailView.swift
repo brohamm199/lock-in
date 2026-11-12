@@ -14,6 +14,54 @@ struct ShareItem: Identifiable {
     let urls: [URL]
 }
 
+/// What you can save or share from a session.
+enum ExportOption: CaseIterable, Identifiable {
+    case statsVideoAndCover, rawVideoAndCover, statsVideo, rawVideo, cover, sticker
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .statsVideoAndCover: return "Video with stats + cover"
+        case .rawVideoAndCover: return "Raw video + cover"
+        case .statsVideo: return "Video with stats"
+        case .rawVideo: return "Raw timelapse"
+        case .cover: return "Cover"
+        case .sticker: return "Sticker"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .statsVideoAndCover: return "rectangle.stack.fill"
+        case .rawVideoAndCover: return "rectangle.stack"
+        case .statsVideo: return "play.rectangle.fill"
+        case .rawVideo: return "film"
+        case .cover: return "photo.fill"
+        case .sticker: return "seal.fill"
+        }
+    }
+
+    func urls(for session: FocusSession) -> [URL]? {
+        switch self {
+        case .statsVideoAndCover:
+            guard let video = session.shareVideoURL, let cover = session.coverURL else { return nil }
+            return [video, cover]
+        case .rawVideoAndCover:
+            guard let video = session.rawVideoURL, let cover = session.coverURL else { return nil }
+            return [video, cover]
+        case .statsVideo:
+            return session.shareVideoURL.map { [$0] }
+        case .rawVideo:
+            return session.rawVideoURL.map { [$0] }
+        case .cover:
+            return session.coverURL.map { [$0] }
+        case .sticker:
+            return session.stickerURL.map { [$0] }
+        }
+    }
+}
+
 struct SessionDetailView: View {
     @EnvironmentObject private var store: SessionStore
     @Environment(\.dismiss) private var dismiss
@@ -28,6 +76,8 @@ struct SessionDetailView: View {
     @State private var renaming = false
     @State private var draftTitle = ""
     @State private var pickingFrame = false
+    @State private var pickingStyle = false
+    @State private var toast: String?
 
     var body: some View {
         Group {
@@ -54,19 +104,23 @@ struct SessionDetailView: View {
                     .frame(maxWidth: .infinity)
 
                 HStack(spacing: 10) {
+                    ShareButton(title: "Style", icon: "paintpalette.fill") {
+                        pickingStyle = true
+                    }
+                    if session.rawVideoURL != nil {
+                        ShareButton(title: "Frame", icon: "photo.on.rectangle") {
+                            pickingFrame = true
+                        }
+                    }
                     ShareButton(title: "Rename", icon: "pencil") {
                         draftTitle = session.title
                         renaming = true
                     }
-                    if session.rawVideoURL != nil {
-                        ShareButton(title: "Cover frame", icon: "photo.on.rectangle") {
-                            pickingFrame = true
-                        }
-                    }
                 }
                 .disabled(rebuilding)
 
-                shareButtons(session)
+                exportButtons(session)
+                    .disabled(rebuilding)
 
                 StatsGrid(session: session)
 
@@ -120,6 +174,27 @@ struct SessionDetailView: View {
                     tab = .cover
                     rebuild(updated, includeVideo: false)
                 }
+            }
+        }
+        .sheet(isPresented: $pickingStyle) {
+            CoverStylePicker(session: session, streak: store.streak) { template in
+                var updated = session
+                updated.coverTemplate = template.rawValue
+                CoverTemplate.lastUsed = template
+                store.upsert(updated)
+                tab = .cover
+                rebuild(updated, includeVideo: false)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let toast {
+                Text(toast)
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Color(white: 0.15), in: Capsule())
+                    .padding(.bottom, 30)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .alert("Rename session", isPresented: $renaming) {
@@ -220,29 +295,58 @@ struct SessionDetailView: View {
             .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
     }
 
-    private func shareButtons(_ session: FocusSession) -> some View {
-        let video = session.shareVideoURL ?? session.rawVideoURL
-        let cover = session.coverURL
-        let sticker = session.stickerURL
+    /// "Save to Photos" and "Share" menus, each offering raw video, stats video, cover, or combinations.
+    private func exportButtons(_ session: FocusSession) -> some View {
+        let options = ExportOption.allCases.filter { $0.urls(for: session) != nil }
 
-        return VStack(spacing: 10) {
-            if let video, let cover {
-                ShareButton(title: "Share video + cover", icon: "square.and.arrow.up", primary: true) {
-                    shareItem = ShareItem(urls: [video, cover])
+        return HStack(spacing: 10) {
+            Menu {
+                ForEach(options) { option in
+                    Button {
+                        save(option.urls(for: session) ?? [])
+                    } label: {
+                        Label(option.title, systemImage: option.icon)
+                    }
                 }
+            } label: {
+                PillLabel(title: "Save to Photos", icon: "square.and.arrow.down", primary: true)
             }
-            HStack(spacing: 10) {
-                if let video {
-                    ShareButton(title: "Video", icon: "play.rectangle.fill") { shareItem = ShareItem(urls: [video]) }
+            Menu {
+                ForEach(options) { option in
+                    Button {
+                        shareItem = ShareItem(urls: option.urls(for: session) ?? [])
+                    } label: {
+                        Label(option.title, systemImage: option.icon)
+                    }
                 }
-                if let cover {
-                    ShareButton(title: "Cover", icon: "photo.fill") { shareItem = ShareItem(urls: [cover]) }
-                }
-                if let sticker {
-                    ShareButton(title: "Sticker", icon: "seal.fill") { shareItem = ShareItem(urls: [sticker]) }
-                }
+            } label: {
+                PillLabel(title: "Share", icon: "square.and.arrow.up")
             }
         }
+    }
+
+    private func save(_ urls: [URL]) {
+        Task {
+            let saved = await PhotoSaver.save(urls)
+            withAnimation { toast = saved ? "Saved to Photos" : "Couldn't save. Allow Photos access in Settings." }
+            try? await Task.sleep(for: .seconds(2.5))
+            withAnimation { toast = nil }
+        }
+    }
+}
+
+struct PillLabel: View {
+    let title: String
+    let icon: String
+    var primary = false
+
+    var body: some View {
+        Label(title, systemImage: icon)
+            .font(.subheadline.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(primary ? Theme.accent : Theme.card, in: RoundedRectangle(cornerRadius: 14))
+            .foregroundStyle(.white)
     }
 }
 

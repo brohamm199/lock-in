@@ -49,6 +49,7 @@ struct SetupView: View {
     @ObservedObject var controller: SessionController
     @ObservedObject var camera: TimelapseCamera
     let onClose: () -> Void
+    @State private var pinchStart: CGFloat?
 
     private var speedHint: String {
         let videoSecondsPerHour = 3600 / controller.frameInterval / Double(TimelapseCamera.outputFPS)
@@ -80,6 +81,18 @@ struct SetupView: View {
                     .background(Theme.card)
                 } else {
                     CameraPreview(session: camera.session)
+                        .gesture(
+                            MagnifyGesture()
+                                .onChanged { value in
+                                    if pinchStart == nil { pinchStart = camera.displayZoom }
+                                    camera.setZoom((pinchStart ?? 1) * value.magnification, animated: false)
+                                }
+                                .onEnded { _ in pinchStart = nil }
+                        )
+                        .overlay(alignment: .bottom) {
+                            ZoomControl(camera: camera)
+                                .padding(.bottom, 12)
+                        }
                 }
             }
             .aspectRatio(9.0 / 16.0, contentMode: .fit)
@@ -133,6 +146,42 @@ struct SetupView: View {
                 .background(Color.white.opacity(0.12), in: Circle())
                 .foregroundStyle(.white)
         }
+    }
+}
+
+/// 0.5× / 1× / 2× / 3× buttons, like the Camera app. The active one shows the exact zoom while pinching.
+struct ZoomControl: View {
+    @ObservedObject var camera: TimelapseCamera
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.zoomPresets, id: \.self) { preset in
+                let active = activePreset == preset
+                Button {
+                    camera.setZoom(preset, animated: true)
+                } label: {
+                    Text(label(for: active ? camera.displayZoom : preset, active: active))
+                        .font(.system(size: active ? 13 : 11, weight: .bold))
+                        .foregroundStyle(active ? Theme.accent : .white)
+                        .frame(width: 40, height: 40)
+                        .background(Color.black.opacity(0.55), in: Circle())
+                }
+            }
+        }
+        .padding(5)
+        .background(Color.black.opacity(0.25), in: Capsule())
+    }
+
+    /// The highest preset at or below the current zoom.
+    private var activePreset: CGFloat? {
+        let atOrBelow = camera.zoomPresets.filter { $0 <= camera.displayZoom + 0.01 }
+        return atOrBelow.max() ?? camera.zoomPresets.first
+    }
+
+    private func label(for value: CGFloat, active: Bool) -> String {
+        let isWhole = abs(value - value.rounded()) < 0.05
+        let number = isWhole ? String(format: "%.0f", value) : String(format: "%.1f", value)
+        return active ? number + "×" : number
     }
 }
 

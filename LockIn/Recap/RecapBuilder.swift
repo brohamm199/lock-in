@@ -6,21 +6,14 @@ import UIKit
 /// Makes everything you share after a session: the cover, the sticker, and the timelapse with stats on it.
 @MainActor
 enum RecapBuilder {
-    /// Pass `includeVideo: false` to only redo the images (much faster, e.g. after picking a new cover frame).
+    /// Pass `includeVideo: false` to only redo the images (much faster, e.g. after picking a new cover frame or style).
     static func build(for session: FocusSession, streak currentStreak: Int, includeVideo: Bool = true) async -> FocusSession {
         var result = session
         let folder = Storage.folder(for: session.id)
         let streak = session.streakAtEnd ?? currentStreak
+        let context = await makeContext(for: session, streak: streak)
 
-        var background: UIImage?
-        var videoSize = CGSize(width: 1080, height: 1920)
-        if let raw = session.rawVideoURL, let info = await VideoTools.inspect(raw, frameAt: session.coverFrameTime) {
-            background = info.thumbnail.map { UIImage(cgImage: $0) }
-            videoSize = info.size
-        }
-
-        let blurred = background.flatMap { blur($0, radius: 45) }
-        if let cover = render(CoverView(session: session, background: background, blurredBackground: blurred, streak: streak), opaque: true),
+        if let cover = render(CoverView(template: session.template, context: context), opaque: true),
            let data = cover.jpegData(compressionQuality: 0.92) {
             if (try? data.write(to: folder.appendingPathComponent("cover.jpg"))) != nil {
                 result.coverFile = "cover.jpg"
@@ -42,7 +35,8 @@ enum RecapBuilder {
         }
 
         if includeVideo, let raw = session.rawVideoURL {
-            let points = CGSize(width: videoSize.width / 3, height: videoSize.height / 3)
+            let size = context.videoSize
+            let points = CGSize(width: size.width / 3, height: size.height / 3)
             if let overlay = render(VideoOverlayView(session: session, size: points, streak: streak), opaque: false) {
                 let output = folder.appendingPathComponent("share.mp4")
                 if await VideoTools.exportWithOverlay(source: raw, to: output, overlay: overlay, session: session) {
@@ -51,6 +45,22 @@ enum RecapBuilder {
             }
         }
         return result
+    }
+
+    /// Everything a cover template needs: the chosen photo, a blurred copy, a few frames, and the stats.
+    static func makeContext(for session: FocusSession, streak: Int) async -> CoverContext {
+        var photo: UIImage?
+        var frames: [UIImage] = []
+        var size = CGSize(width: 1080, height: 1920)
+        if let raw = session.rawVideoURL {
+            if let info = await VideoTools.inspect(raw, frameAt: session.coverFrameTime) {
+                photo = info.thumbnail.map { UIImage(cgImage: $0) }
+                size = info.size
+            }
+            frames = await VideoTools.frames(from: raw, fractions: [0.2, 0.5, 0.8], maxSize: CGSize(width: 540, height: 960))
+        }
+        let blurred = photo.flatMap { blur($0, radius: 45) }
+        return CoverContext(session: session, photo: photo, blurred: blurred, frames: frames, streak: streak, videoSize: size)
     }
 
     private static func blur(_ image: UIImage, radius: Float) -> UIImage? {
@@ -95,125 +105,169 @@ enum VideoTools {
         return Info(size: size, thumbnail: thumbnail)
     }
 
-    /// Burns the stats overlay, a ticking session clock and a progress bar into the timelapse.
-    static func exportWithOverlay(source: URL, to output: URL, overlay: UIImage, session: FocusSession) async -> Bool {
-        let asset = AVURLAsset(url: source)
-        do {
-            guard let track = try await asset.loadTracks(withMediaType: .video).first else { return false }
-            let props = try await track.load(.naturalSize, .preferredTransform)
-            let duration = try await asset.load(.duration)
-            let rect = CGRect(origin: .zero, size: props.0).applying(props.1)
-            let size = CGSize(width: abs(rect.width), height: abs(rect.height))
-            let seconds = max(CMTimeGetSeconds(duration), 0.1)
-
-            let composition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)
-            composition.renderSize = size
-            composition.frameDuration = CMTime(value: 1, timescale: TimelapseCamera.outputFPS)
-
-            let parent = CALayer()
-            parent.frame = CGRect(origin: .zero, size: size)
-            let videoLayer = CALayer()
-            videoLayer.frame = parent.frame
-            parent.addSublayer(videoLayer)
-
-            let overlayLayer = CALayer()
-            overlayLayer.frame = parent.frame
-            overlayLayer.contents = overlay.cgImage
-            overlayLayer.contentsGravity = .resize
-            parent.addSublayer(overlayLayer)
-
-            // Core Animation's origin is the bottom-left corner here, so flip the "from top" layout values.
-            func slot(top: CGFloat, height: CGFloat) -> CGRect {
-                let inset = size.width * OverlayLayout.sideInset
-                return CGRect(
-                    x: inset,
-                    y: size.height * (1 - top - height),
-                    width: size.width - inset * 2,
-                    height: size.height * height
-                )
+    static func frames(from url: URL, fractions: [Double], maxSize: CGSize) async -> [UIImage] {
+        let asset = AVURLAsset(url: url)
+        guard let duration = try? await asset.load(.duration) else { return [] }
+        let total = CMTimeGetSeconds(duration)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = maxSize
+        var images: [UIImage] = []
+        for fraction in fractions {
+            let seconds = max(0, min(total - 0.01, total * fraction))
+            if let cg = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image {
+                images.append(UIImage(cgImage: cg))
             }
-
-            // Ticking clock: a flipbook of pre-drawn times.
-            let timerRect = slot(top: OverlayLayout.timerTop, height: OverlayLayout.timerHeight)
-            let frameCount = min(150, max(2, Int(seconds * 10)))
-            let clockImages = makeClockImages(total: session.duration, count: frameCount, size: timerRect.size)
-            let timerLayer = CALayer()
-            timerLayer.frame = timerRect
-            timerLayer.contentsGravity = .resize
-            timerLayer.contents = clockImages.last
-            let tick = CAKeyframeAnimation(keyPath: "contents")
-            tick.values = clockImages
-            tick.calculationMode = .discrete
-            tick.beginTime = AVCoreAnimationBeginTimeAtZero
-            tick.duration = seconds
-            tick.isRemovedOnCompletion = false
-            tick.fillMode = .both
-            timerLayer.add(tick, forKey: "tick")
-            parent.addSublayer(timerLayer)
-
-            // Progress bar that fills over the video.
-            let barRect = slot(top: OverlayLayout.barTop, height: OverlayLayout.barHeight)
-            let barTrack = CALayer()
-            barTrack.frame = barRect
-            barTrack.backgroundColor = UIColor.white.withAlphaComponent(0.25).cgColor
-            barTrack.cornerRadius = barRect.height / 2
-            parent.addSublayer(barTrack)
-
-            let barFill = CALayer()
-            barFill.anchorPoint = CGPoint(x: 0, y: 0.5)
-            barFill.frame = barRect
-            barFill.backgroundColor = Theme.accentUIColor.cgColor
-            barFill.cornerRadius = barRect.height / 2
-            let grow = CABasicAnimation(keyPath: "transform.scale.x")
-            grow.fromValue = 0.001
-            grow.toValue = 1.0
-            grow.beginTime = AVCoreAnimationBeginTimeAtZero
-            grow.duration = seconds
-            grow.isRemovedOnCompletion = false
-            grow.fillMode = .both
-            barFill.add(grow, forKey: "grow")
-            parent.addSublayer(barFill)
-
-            composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
-
-            guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
-                return false
-            }
-            exporter.videoComposition = composition
-            try? FileManager.default.removeItem(at: output)
-
-            if #available(iOS 18, *) {
-                try await exporter.export(to: output, as: .mp4)
-                return true
-            } else {
-                exporter.outputURL = output
-                exporter.outputFileType = .mp4
-                await exporter.export()
-                return exporter.status == .completed
-            }
-        } catch {
-            return false
         }
+        return images
     }
 
-    private static func makeClockImages(total: TimeInterval, count: Int, size: CGSize) -> [CGImage] {
-        // Drawn at 60% size to keep memory low; the layer scales them up.
-        let drawSize = CGSize(width: (size.width * 0.6).rounded(), height: (size.height * 0.6).rounded())
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(size: drawSize, format: format)
-        let font = UIFont.monospacedDigitSystemFont(ofSize: drawSize.height * 0.9, weight: .heavy)
-        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: UIColor.white]
+    /// Burns the stats overlay into the timelapse, drawing the session clock and progress bar
+    /// fresh on every frame so the clock rolls smoothly instead of jumping.
+    static func exportWithOverlay(source: URL, to output: URL, overlay: UIImage, session: FocusSession) async -> Bool {
+        let asset = AVURLAsset(url: source)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let natural = try? await track.load(.naturalSize),
+              let overlayImage = overlay.cgImage else { return false }
+        let job = OverlayRenderJob(
+            asset: asset,
+            track: track,
+            size: CGSize(width: abs(natural.width), height: abs(natural.height)),
+            overlay: overlayImage,
+            session: session,
+            output: output
+        )
+        return await Task.detached(priority: .userInitiated) { job.run() }.value
+    }
+}
 
-        return (0..<count).compactMap { i in
-            let t = total * Double(i) / Double(max(count - 1, 1))
-            let text = Fmt.clock(t) as NSString
-            let image = renderer.image { _ in
-                let textSize = text.size(withAttributes: attributes)
-                text.draw(at: CGPoint(x: 0, y: (drawSize.height - textSize.height) / 2), withAttributes: attributes)
+/// Reads each timelapse frame, draws the overlay + clock + progress bar on it, and writes it back out.
+private final class OverlayRenderJob: @unchecked Sendable {
+    private let asset: AVAsset
+    private let track: AVAssetTrack
+    private let size: CGSize
+    private let overlay: CGImage
+    private let session: FocusSession
+    private let output: URL
+    private let clockAttributes: [NSAttributedString.Key: Any]
+
+    init(asset: AVAsset, track: AVAssetTrack, size: CGSize, overlay: CGImage, session: FocusSession, output: URL) {
+        self.asset = asset
+        self.track = track
+        self.size = size
+        self.overlay = overlay
+        self.session = session
+        self.output = output
+        let fontSize = size.height * OverlayLayout.timerHeight * 0.9
+        clockAttributes = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .heavy),
+            .foregroundColor: UIColor.white,
+        ]
+    }
+
+    func run() -> Bool {
+        try? FileManager.default.removeItem(at: output)
+        guard let reader = try? AVAssetReader(asset: asset) else { return false }
+        let readerOutput = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        )
+        readerOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(readerOutput) else { return false }
+        reader.add(readerOutput)
+
+        guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mp4) else { return false }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 12_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            ],
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+        guard writer.canAdd(input) else { return false }
+        writer.add(input)
+
+        guard reader.startReading(), writer.startWriting() else { return false }
+        writer.startSession(atSourceTime: .zero)
+
+        let totalFrames = max(session.frameCount, 1)
+        var index = 0
+        var failed = false
+
+        while !failed, let sample = readerOutput.copyNextSampleBuffer() {
+            autoreleasepool {
+                guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
+                let progress = totalFrames > 1 ? min(1, Double(index) / Double(totalFrames - 1)) : 1
+                draw(on: pixelBuffer, progress: progress)
+
+                while !input.isReadyForMoreMediaData {
+                    if writer.status != .writing { failed = true; return }
+                    Thread.sleep(forTimeInterval: 0.002)
+                }
+                let time = CMSampleBufferGetPresentationTimeStamp(sample)
+                if !adaptor.append(pixelBuffer, withPresentationTime: time) {
+                    failed = true
+                    return
+                }
+                index += 1
             }
-            return image.cgImage
         }
+
+        if failed || reader.status == .failed {
+            reader.cancelReading()
+            writer.cancelWriting()
+            return false
+        }
+
+        input.markAsFinished()
+        let done = DispatchSemaphore(value: 0)
+        writer.finishWriting { done.signal() }
+        done.wait()
+        return writer.status == .completed
+    }
+
+    private func draw(on pixelBuffer: CVPixelBuffer, progress: Double) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard let context = CGContext(
+            data: base,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return }
+
+        let w = CGFloat(width)
+        let h = CGFloat(height)
+        context.draw(overlay, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        // Switch to top-left origin so the layout fractions (measured from the top) apply directly.
+        context.translateBy(x: 0, y: h)
+        context.scaleBy(x: 1, y: -1)
+        UIGraphicsPushContext(context)
+        defer { UIGraphicsPopContext() }
+
+        let inset = w * OverlayLayout.sideInset
+        let timerRect = CGRect(x: inset, y: h * OverlayLayout.timerTop, width: w - inset * 2, height: h * OverlayLayout.timerHeight)
+        let text = Fmt.clock(session.duration * progress) as NSString
+        let textSize = text.size(withAttributes: clockAttributes)
+        text.draw(at: CGPoint(x: timerRect.minX, y: timerRect.midY - textSize.height / 2), withAttributes: clockAttributes)
+
+        let barRect = CGRect(x: inset, y: h * OverlayLayout.barTop, width: w - inset * 2, height: h * OverlayLayout.barHeight)
+        let radius = barRect.height / 2
+        UIColor.white.withAlphaComponent(0.25).setFill()
+        UIBezierPath(roundedRect: barRect, cornerRadius: radius).fill()
+        let filled = CGRect(x: barRect.minX, y: barRect.minY, width: max(barRect.height, barRect.width * CGFloat(progress)), height: barRect.height)
+        Theme.accentUIColor.setFill()
+        UIBezierPath(roundedRect: filled, cornerRadius: radius).fill()
     }
 }

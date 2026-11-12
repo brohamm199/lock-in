@@ -33,6 +33,12 @@ struct FocusSession: Codable, Identifiable, Hashable {
     var coverFrameTime: Double?
     /// Streak at the moment the session ended, so rebuilding a recap later shows the same number.
     var streakAtEnd: Int?
+    /// Raw value of the `CoverTemplate` picked for this session.
+    var coverTemplate: String?
+
+    var template: CoverTemplate {
+        coverTemplate.flatMap { CoverTemplate(rawValue: $0) } ?? .glass
+    }
 
     var duration: TimeInterval { max(0, endDate.timeIntervalSince(startDate)) }
     var distractedTime: TimeInterval { min(duration, distractions.reduce(0) { $0 + $1.length }) }
