@@ -15,7 +15,7 @@ struct HomeView: View {
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: "record.circle.fill")
-                            Text("Lock in")
+                            Text("Enter the tunnel")
                         }
                         .font(.title3.weight(.bold))
                         .frame(maxWidth: .infinity)
@@ -25,7 +25,7 @@ struct HomeView: View {
                     }
 
                     if store.sessions.isEmpty {
-                        Text("No sessions yet. Prop your phone up, hit Lock in, and get to work.")
+                        Text("No sessions yet. Prop your phone up, hit Enter the tunnel, and get to work.")
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: .infinity)
@@ -46,7 +46,7 @@ struct HomeView: View {
                 .padding()
             }
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle("Lock In")
+            .navigationTitle("Tunnel")
             .navigationDestination(for: UUID.self) { id in
                 SessionDetailView(sessionID: id)
             }

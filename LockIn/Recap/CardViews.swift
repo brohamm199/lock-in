@@ -16,9 +16,9 @@ struct BrandMark: View {
 
     var body: some View {
         HStack(spacing: size * 0.35) {
-            Image(systemName: "lock.fill")
+            Image(systemName: "circle.circle.fill")
                 .font(.system(size: size * 0.9, weight: .black))
-            Text("LOCK IN")
+            Text("TUNNEL")
                 .font(.system(size: size, weight: .black))
                 .italic()
                 .tracking(size * 0.12)

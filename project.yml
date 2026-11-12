@@ -26,7 +26,7 @@ targets:
     info:
       path: LockIn/Info.plist
       properties:
-        CFBundleDisplayName: Lock In
+        CFBundleDisplayName: Tunnel
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -34,8 +34,8 @@ targets:
           - UIInterfaceOrientationPortrait
         UIRequiresFullScreen: true
         UIStatusBarStyle: UIStatusBarStyleLightContent
-        NSCameraUsageDescription: Lock In records a timelapse of your focus session.
-        NSMotionUsageDescription: Lock In notices when you pick up your phone during a session.
+        NSCameraUsageDescription: Tunnel records a timelapse of your focus session.
+        NSMotionUsageDescription: Tunnel notices when you pick up your phone during a session.
         NSPhotoLibraryAddUsageDescription: Save your session timelapse and cover to Photos.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

@@ -196,6 +196,6 @@ final class SessionController: ObservableObject {
         case 17..<21: part = "Evening"
         default: part = "Late Night"
         }
-        return "\(part) Lock In"
+        return "\(part) Session"
     }
 }

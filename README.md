@@ -1,4 +1,4 @@
-# Lock In
+# Tunnel
 
 A personal "Strava for focus" iPhone app. Prop your phone up, start a session, and it:
 
@@ -28,4 +28,4 @@ Free Apple ID installs expire after 7 days. Re-run step 2 to refresh; your sessi
 - Turn on **Guided Access** (Settings → Accessibility → Guided Access), then triple-click the side button
   during a session so you can't leave the app.
 - Plug the phone in for long sessions.
-- Your recordings are also visible in the Files app under **On My iPhone → Lock In**.
+- Your recordings are also visible in the Files app under **On My iPhone → Tunnel**.
