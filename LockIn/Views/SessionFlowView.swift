@@ -253,10 +253,24 @@ struct RecordingView: View {
                 }
                 HStack(spacing: 6) {
                     Circle().fill(Color.red.opacity(0.35)).frame(width: 6, height: 6)
+                    FrameCounter(camera: controller.camera)
+                    Text("·")
                     Text(controller.pickupCount == 1 ? "1 pickup" : "\(controller.pickupCount) pickups")
                 }
-                .font(.caption2)
+                .font(.caption2.monospacedDigit())
                 .foregroundStyle(Color(white: 0.2))
+
+                if controller.cameraStalled {
+                    VStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill").font(.title2)
+                        Text("Camera isn't saving frames").font(.headline)
+                        Text("Trying to restart it. If this stays,\nhold to end and start a new session.")
+                            .font(.caption)
+                            .multilineTextAlignment(.center)
+                    }
+                    .foregroundStyle(Color.yellow.opacity(0.8))
+                    .padding(.top, 30)
+                }
 
                 Spacer()
 
@@ -302,6 +316,15 @@ struct RecordingView: View {
     }
 }
 
+/// Live "123 frames" readout, so you can see the timelapse is actually saving.
+struct FrameCounter: View {
+    @ObservedObject var camera: TimelapseCamera
+
+    var body: some View {
+        Text(camera.framesCaptured == 1 ? "1 frame" : "\(camera.framesCaptured) frames")
+    }
+}
+
 struct ProcessingView: View {
     var body: some View {
         VStack(spacing: 16) {
@@ -310,7 +333,7 @@ struct ProcessingView: View {
                 .tint(Theme.accent)
             Text("Building your recap…")
                 .font(.headline)
-            Text("Rendering the cover and the timelapse.")
+            Text("Saving the timelapse, then rendering the cover and video.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

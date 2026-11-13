@@ -33,6 +33,8 @@ struct FocusSession: Codable, Identifiable, Hashable {
     var coverFrameTime: Double?
     /// Streak at the moment the session ended, so rebuilding a recap later shows the same number.
     var streakAtEnd: Int?
+    /// What happened with the camera during the session, for troubleshooting.
+    var recordingLog: [String]?
     /// Raw value of the `CoverTemplate` picked for this session.
     var coverTemplate: String?
 

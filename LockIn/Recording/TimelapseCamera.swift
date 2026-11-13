@@ -3,6 +3,10 @@ import UIKit
 
 /// Runs the camera and writes one frame every `interval` seconds into a 30 fps video,
 /// which is what turns hours of work into a short timelapse.
+///
+/// Recording is built to survive failures: video goes into numbered "part" files written as
+/// fragmented QuickTime movies (playable up to the last second even if writing dies), and if the
+/// encoder ever fails, a new part starts on the next frame instead of giving up.
 final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     static let outputFPS: Int32 = 30
 
@@ -12,9 +16,14 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
     /// Zoom buttons to show, in "camera app" terms (0.5×, 1×, 2×, 3×).
     @Published private(set) var zoomPresets: [CGFloat] = [1]
     @Published private(set) var displayZoom: CGFloat = 1
+    /// Frames saved so far this session (shown live on the recording screen).
+    @Published private(set) var framesCaptured = 0
 
-    private let sessionQueue = DispatchQueue(label: "lockin.camera.session")
-    private let frameQueue = DispatchQueue(label: "lockin.camera.frames")
+    /// Plain-English events for the session's recording log. Called on the main queue.
+    var onEvent: ((String) -> Void)?
+
+    private let sessionQueue = DispatchQueue(label: "tunnel.camera.session")
+    private let frameQueue = DispatchQueue(label: "tunnel.camera.frames")
     private let videoOutput = AVCaptureVideoDataOutput()
     private var input: AVCaptureDeviceInput?
     // Only touched on sessionQueue. zoomBase is the device zoom factor that counts as "1×".
@@ -25,18 +34,30 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
     private var recording = false
     private var interval: Double = 2
     private var lastFrameTime = CMTime.invalid
-    private var frames = 0
-    private var outputURL: URL?
+    private var folder: URL?
+    private var parts: [URL] = []
+    private var partIndex = 0
+    private var partFrames = 0
+    private var totalFrames = 0
+    private var failedStarts = 0
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var writerFailed = false
 
-    private struct WriterSnapshot: @unchecked Sendable {
-        let writer: AVAssetWriter?
-        let input: AVAssetWriterInput?
-        let url: URL?
-        let frames: Int
+    override init() {
+        super.init()
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(sessionWasInterrupted(_:)), name: AVCaptureSession.wasInterruptedNotification, object: session)
+        center.addObserver(self, selector: #selector(sessionInterruptionEnded(_:)), name: AVCaptureSession.interruptionEndedNotification, object: session)
+        center.addObserver(self, selector: #selector(sessionRuntimeError(_:)), name: AVCaptureSession.runtimeErrorNotification, object: session)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    private func report(_ message: String) {
+        DispatchQueue.main.async { self.onEvent?(message) }
     }
 
     // MARK: Camera lifecycle
@@ -62,6 +83,16 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
     func stop() {
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
+        }
+    }
+
+    /// Used by the stall watchdog: kick the camera if frames stop arriving.
+    func restartSession() {
+        sessionQueue.async {
+            if self.session.isRunning { self.session.stopRunning() }
+            self.session.startRunning()
+            self.setLowPowerFrameRate(true)
+            self.report(self.session.isRunning ? "Camera restarted" : "Camera failed to restart")
         }
     }
 
@@ -107,6 +138,37 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
         // Portrait frames, ready for Instagram stories.
         if let connection = videoOutput.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
+        }
+    }
+
+    // MARK: Interruptions
+
+    @objc private func sessionWasInterrupted(_ notification: Notification) {
+        let raw = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
+        let reason = raw.flatMap { AVCaptureSession.InterruptionReason(rawValue: $0) }
+        let text = reason.map(Self.describe) ?? "unknown reason"
+        report("Camera paused: \(text)")
+    }
+
+    private static func describe(_ reason: AVCaptureSession.InterruptionReason) -> String {
+        switch reason {
+        case .videoDeviceNotAvailableInBackground: return "app went to the background"
+        case .audioDeviceInUseByAnotherClient, .videoDeviceInUseByAnotherClient: return "another app is using the camera"
+        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "multiple apps on screen"
+        case .videoDeviceNotAvailableDueToSystemPressure: return "phone too hot"
+        default: return "reason \(reason.rawValue)"
+        }
+    }
+
+    @objc private func sessionInterruptionEnded(_ notification: Notification) {
+        report("Camera resumed")
+    }
+
+    @objc private func sessionRuntimeError(_ notification: Notification) {
+        let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        report("Camera error: \(error?.localizedDescription ?? "unknown"). Restarting it.")
+        sessionQueue.async {
+            if !self.session.isRunning { self.session.startRunning() }
         }
     }
 
@@ -195,93 +257,168 @@ final class TimelapseCamera: NSObject, ObservableObject, AVCaptureVideoDataOutpu
 
     // MARK: Recording
 
-    func startRecording(to url: URL, interval: Double) {
+    func startRecording(in folder: URL, interval: Double) {
         frameQueue.async {
-            self.outputURL = url
+            self.folder = folder
             self.interval = interval
             self.lastFrameTime = .invalid
-            self.frames = 0
+            self.parts = []
+            self.partIndex = 0
+            self.partFrames = 0
+            self.totalFrames = 0
+            self.failedStarts = 0
             self.writer = nil
             self.writerInput = nil
             self.adaptor = nil
-            self.writerFailed = false
             self.recording = true
         }
+        DispatchQueue.main.async { self.framesCaptured = 0 }
         sessionQueue.async { self.setLowPowerFrameRate(true) }
+        report("Recording started (1 frame every \(Int(interval))s)")
     }
 
-    func stopRecording() async -> (url: URL?, frames: Int) {
-        let snapshot: WriterSnapshot = await withCheckedContinuation { continuation in
+    /// Cleanly closes the current part, e.g. before the app goes to the background,
+    /// where the video encoder isn't allowed to run. The next frame starts a new part.
+    func closeCurrentPart() {
+        frameQueue.async { self.finishCurrentPart(completion: nil) }
+    }
+
+    /// Stops recording and returns every part file that has video in it, in order.
+    func stopRecording() async -> [URL] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             frameQueue.async {
                 self.recording = false
-                let snap = WriterSnapshot(writer: self.writer, input: self.writerInput, url: self.outputURL, frames: self.frames)
-                self.writer = nil
-                self.writerInput = nil
-                self.adaptor = nil
-                continuation.resume(returning: snap)
+                self.finishCurrentPart { continuation.resume() }
             }
         }
         sessionQueue.async { self.setLowPowerFrameRate(false) }
-
-        guard let writer = snapshot.writer, let input = snapshot.input, writer.status == .writing else {
-            return (nil, 0)
+        return await withCheckedContinuation { (continuation: CheckedContinuation<[URL], Never>) in
+            frameQueue.async {
+                let total = self.totalFrames
+                self.report("Recording stopped: \(total) frames in \(self.parts.count) part(s)")
+                continuation.resume(returning: self.parts)
+            }
         }
-        guard snapshot.frames > 0 else {
-            writer.cancelWriting()
-            return (nil, 0)
-        }
-        input.markAsFinished()
-        await writer.finishWriting()
-        return writer.status == .completed ? (snapshot.url, snapshot.frames) : (nil, 0)
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard recording, !writerFailed else { return }
+        guard recording else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if lastFrameTime.isValid, CMTimeGetSeconds(CMTimeSubtract(time, lastFrameTime)) < interval - 0.05 {
             return
         }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // A failed writer used to end the recording for good. Now: keep what it wrote, start a new part.
+        if let current = writer, current.status == .failed || current.status == .cancelled {
+            report("Part \(partIndex) stopped (\(current.error?.localizedDescription ?? "unknown error")). Starting a new part.")
+            writer = nil
+            writerInput = nil
+            adaptor = nil
+        }
         if writer == nil {
-            makeWriter(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+            // Back off if writers keep failing to start, but never give up entirely.
+            if failedStarts > 0, lastFrameTime.isValid,
+               CMTimeGetSeconds(CMTimeSubtract(time, lastFrameTime)) < min(60, Double(failedStarts) * 5) {
+                return
+            }
+            startPart(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         }
         guard let writer, writer.status == .writing,
               let writerInput, let adaptor,
               writerInput.isReadyForMoreMediaData else { return }
 
-        let presentationTime = CMTime(value: CMTimeValue(frames), timescale: Self.outputFPS)
+        let presentationTime = CMTime(value: CMTimeValue(partFrames), timescale: Self.outputFPS)
         if adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
-            frames += 1
+            partFrames += 1
+            totalFrames += 1
             lastFrameTime = time
+            let count = totalFrames
+            if count == 1 { report("First frame saved") }
+            DispatchQueue.main.async { self.framesCaptured = count }
         }
     }
 
-    private func makeWriter(width: Int, height: Int) {
-        guard let url = outputURL else { writerFailed = true; return }
+    private func startPart(width: Int, height: Int) {
+        guard let folder else { return }
+        partIndex += 1
+        let url = folder.appendingPathComponent("part\(partIndex).mov")
         try? FileManager.default.removeItem(at: url)
-        guard let newWriter = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { writerFailed = true; return }
 
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 10_000_000,
-                AVVideoMaxKeyFrameIntervalKey: 30,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ]
-        let newInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        newInput.expectsMediaDataInRealTime = true
-        let newAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: newInput, sourcePixelBufferAttributes: nil)
+        do {
+            let newWriter = try AVAssetWriter(outputURL: url, fileType: .mov)
+            // Fragmented movie: if writing dies, everything up to the last fragment is still playable.
+            newWriter.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
 
-        guard newWriter.canAdd(newInput) else { writerFailed = true; return }
-        newWriter.add(newInput)
-        guard newWriter.startWriting() else { writerFailed = true; return }
-        newWriter.startSession(atSourceTime: .zero)
+            let settings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: 10_000_000,
+                    AVVideoMaxKeyFrameIntervalKey: 30,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                ],
+            ]
+            let newInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            newInput.expectsMediaDataInRealTime = true
+            let newAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: newInput, sourcePixelBufferAttributes: nil)
 
-        writer = newWriter
-        writerInput = newInput
-        adaptor = newAdaptor
+            guard newWriter.canAdd(newInput) else {
+                failedStarts += 1
+                report("Couldn't set up part \(partIndex)")
+                return
+            }
+            newWriter.add(newInput)
+            guard newWriter.startWriting() else {
+                failedStarts += 1
+                report("Couldn't start part \(partIndex): \(newWriter.error?.localizedDescription ?? "unknown error")")
+                return
+            }
+            newWriter.startSession(atSourceTime: .zero)
+
+            writer = newWriter
+            writerInput = newInput
+            adaptor = newAdaptor
+            partFrames = 0
+            failedStarts = 0
+            parts.append(url)
+            if partIndex > 1 { report("Part \(partIndex) started") }
+        } catch {
+            failedStarts += 1
+            report("Couldn't create part \(partIndex): \(error.localizedDescription)")
+        }
+    }
+
+    /// Must run on frameQueue.
+    private func finishCurrentPart(completion: (() -> Void)?) {
+        guard let current = writer, let input = writerInput else {
+            completion?()
+            return
+        }
+        writer = nil
+        writerInput = nil
+        adaptor = nil
+        let index = partIndex
+
+        guard current.status == .writing else {
+            // Already failed: the fragmented file keeps what was written before the failure.
+            report("Part \(index) ended early (\(current.error?.localizedDescription ?? "unknown error"))")
+            completion?()
+            return
+        }
+        if partFrames == 0 {
+            current.cancelWriting()
+            parts.removeAll { $0 == current.outputURL }
+            completion?()
+            return
+        }
+        input.markAsFinished()
+        current.finishWriting {
+            if current.status != .completed {
+                self.report("Part \(index) didn't close cleanly (\(current.error?.localizedDescription ?? "unknown error"))")
+            }
+            completion?()
+        }
     }
 }

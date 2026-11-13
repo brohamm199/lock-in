@@ -105,6 +105,83 @@ enum VideoTools {
         return Info(size: size, thumbnail: thumbnail)
     }
 
+    /// Joins recorded part files into one timelapse. Unreadable parts are skipped, so one bad part
+    /// never costs the rest of the session. Returns the final file and how many frames it has.
+    static func assemble(parts: [URL], into output: URL) async -> (url: URL?, frames: Int, log: [String]) {
+        var log: [String] = []
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            return (nil, 0, ["Couldn't create a video track"])
+        }
+        var usable: [URL] = []
+        var cursor = CMTime.zero
+        for url in parts {
+            let asset = AVURLAsset(url: url)
+            guard let source = try? await asset.loadTracks(withMediaType: .video).first,
+                  let range = try? await source.load(.timeRange),
+                  CMTimeGetSeconds(range.duration) > 0 else {
+                log.append("\(url.lastPathComponent): no readable video, skipped")
+                continue
+            }
+            do {
+                try track.insertTimeRange(range, of: source, at: cursor)
+                if usable.isEmpty, let transform = try? await source.load(.preferredTransform) {
+                    track.preferredTransform = transform
+                }
+                cursor = CMTimeAdd(cursor, range.duration)
+                usable.append(url)
+            } catch {
+                log.append("\(url.lastPathComponent): couldn't be joined (\(error.localizedDescription))")
+            }
+        }
+        let frames = Int((CMTimeGetSeconds(cursor) * Double(TimelapseCamera.outputFPS)).rounded())
+        guard frames > 0 else { return (nil, 0, log + ["No video could be saved"]) }
+
+        // One clean part: use it as-is.
+        if usable.count == 1 {
+            return (usable[0], frames, log)
+        }
+
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
+            return (usable[0], frames, log + ["Couldn't join parts; kept part 1 only"])
+        }
+        try? FileManager.default.removeItem(at: output)
+        var exported = false
+        if #available(iOS 18, *) {
+            exported = (try? await exporter.export(to: output, as: .mov)) != nil
+        } else {
+            exporter.outputURL = output
+            exporter.outputFileType = .mov
+            await exporter.export()
+            exported = exporter.status == .completed
+        }
+        guard exported else {
+            return (usable[0], frames, log + ["Couldn't join parts; kept part 1 only"])
+        }
+        for url in usable { try? FileManager.default.removeItem(at: url) }
+        log.append("Joined \(usable.count) parts")
+        return (output, frames, log)
+    }
+
+    /// Video files left in a session's folder (parts, or an unfinished raw file from older versions).
+    static func leftoverVideoFiles(in folder: URL) -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        let parts = files
+            .filter { $0.lastPathComponent.hasPrefix("part") && $0.pathExtension == "mov" }
+            .sorted { partNumber($0) < partNumber($1) }
+        let older = files.filter { ["raw.mp4", "raw.mov"].contains($0.lastPathComponent) }
+        return parts + older
+    }
+
+    private static func partNumber(_ url: URL) -> Int {
+        Int(url.deletingPathExtension().lastPathComponent.dropFirst(4)) ?? 0
+    }
+
+    static func fileSizeText(_ url: URL) -> String {
+        let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
     static func frames(from url: URL, fractions: [Double], maxSize: CGSize) async -> [UIImage] {
         let asset = AVURLAsset(url: url)
         guard let duration = try? await asset.load(.duration) else { return [] }

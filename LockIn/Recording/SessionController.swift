@@ -19,8 +19,12 @@ final class SessionController: ObservableObject {
     @Published private(set) var startDate: Date?
     @Published private(set) var isPickedUp = false
     @Published private(set) var pickupCount = 0
+    /// True when no new frames have arrived for a while — shown as a warning on the black screen.
+    @Published private(set) var cameraStalled = false
 
     let camera = TimelapseCamera()
+    private var log: [String] = []
+    private var watchdogTask: Task<Void, Never>?
     private let detector = PickupDetector()
     private let sessionID = UUID()
     private var distractions: [DistractionInterval] = []
@@ -41,6 +45,49 @@ final class SessionController: ObservableObject {
         }
         detector.onSettled = { [weak self] in
             MainActor.assumeIsolated { self?.handleSettled() }
+        }
+        camera.onEvent = { [weak self] message in
+            MainActor.assumeIsolated { self?.addLog(message) }
+        }
+    }
+
+    private func addLog(_ message: String) {
+        let stamp = startDate == nil ? "--:--" : Fmt.clock(elapsed)
+        log.append("\(stamp)  \(message)")
+    }
+
+    /// Checks every few seconds that frames are still arriving; restarts the camera if they stop.
+    private func startWatchdog() {
+        watchdogTask?.cancel()
+        let allowedGap = max(20, frameInterval * 8)
+        watchdogTask = Task { [weak self] in
+            var lastCount = 0
+            var lastProgress = Date()
+            var restarts = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, self.phase == .recording else { return }
+                let count = self.camera.framesCaptured
+                if count > lastCount {
+                    lastCount = count
+                    lastProgress = Date()
+                    restarts = 0
+                    if self.cameraStalled {
+                        self.cameraStalled = false
+                        self.addLog("Frames are coming in again")
+                    }
+                } else if Date().timeIntervalSince(lastProgress) > allowedGap {
+                    if !self.cameraStalled {
+                        self.cameraStalled = true
+                        self.addLog("No new frames for \(Int(allowedGap))s")
+                    }
+                    if restarts < 5 {
+                        restarts += 1
+                        self.camera.restartSession()
+                    }
+                    lastProgress = Date()
+                }
+            }
         }
     }
 
@@ -70,9 +117,10 @@ final class SessionController: ObservableObject {
     }
 
     private func startRecording() {
-        let url = Storage.folder(for: sessionID).appendingPathComponent("raw.mp4")
-        camera.startRecording(to: url, interval: frameInterval)
         startDate = Date()
+        log = []
+        cameraStalled = false
+        camera.startRecording(in: Storage.folder(for: sessionID), interval: frameInterval)
         distractions = []
         openDistraction = nil
         pickupCount = 0
@@ -80,11 +128,13 @@ final class SessionController: ObservableObject {
         detector.start()
         dimScreen()
         phase = .recording
+        startWatchdog()
     }
 
     func finish(store: SessionStore) async {
         guard phase == .recording, let start = startDate else { return }
         phase = .finishing
+        watchdogTask?.cancel()
         detector.stop()
         let end = Date()
         let total = end.timeIntervalSince(start)
@@ -93,8 +143,14 @@ final class SessionController: ObservableObject {
         distractions.removeAll { $0.start > total - 15 }
         restoreScreen()
 
-        let result = await camera.stopRecording()
+        let parts = await camera.stopRecording()
         camera.stop()
+        let folder = Storage.folder(for: sessionID)
+        let result = await VideoTools.assemble(parts: parts, into: folder.appendingPathComponent("raw.mov"))
+        for line in result.log { addLog(line) }
+        if let url = result.url {
+            addLog("Saved \(result.frames) frames (\(VideoTools.fileSizeText(url)))")
+        }
 
         var session = FocusSession(
             id: sessionID,
@@ -106,6 +162,7 @@ final class SessionController: ObservableObject {
             frameCount: result.frames,
             rawVideoFile: result.url?.lastPathComponent
         )
+        session.recordingLog = log
         store.upsert(session)
         session.streakAtEnd = store.streak
         session.coverTemplate = CoverTemplate.lastUsed.rawValue
@@ -116,6 +173,7 @@ final class SessionController: ObservableObject {
 
     func teardown() {
         countdownTask?.cancel()
+        watchdogTask?.cancel()
         detector.stop()
         if phase == .recording {
             let camera = self.camera
@@ -152,6 +210,9 @@ final class SessionController: ObservableObject {
         switch newPhase {
         case .background:
             openDistractionIfNeeded(.leftApp)
+            // The video encoder can't run in the background; close the part cleanly so nothing is lost.
+            camera.closeCurrentPart()
+            addLog("Left the app")
         case .active:
             if openDistraction?.kind == .leftApp { closeOpenDistraction() }
             UIScreen.main.brightness = isPickedUp ? 0.35 : 0

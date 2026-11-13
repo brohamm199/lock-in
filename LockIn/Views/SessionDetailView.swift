@@ -78,6 +78,8 @@ struct SessionDetailView: View {
     @State private var pickingFrame = false
     @State private var pickingStyle = false
     @State private var toast: String?
+    @State private var recovering = false
+    @State private var recoverMessage: String?
 
     var body: some View {
         Group {
@@ -122,7 +124,28 @@ struct SessionDetailView: View {
                 exportButtons(session)
                     .disabled(rebuilding)
 
+                if session.rawVideoURL == nil {
+                    recoverSection(session)
+                }
+
                 StatsGrid(session: session)
+
+                if let log = session.recordingLog, !log.isEmpty {
+                    DisclosureGroup("Recording log") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(log.indices, id: \.self) { index in
+                                Text(log[index])
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .padding()
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
+                }
 
                 if session.coverFile == nil || (session.rawVideoFile != nil && session.shareVideoFile == nil) {
                     Button {
@@ -267,7 +290,7 @@ struct SessionDetailView: View {
                     }
                     .onDisappear { player?.pause() }
             } else {
-                placeholder("No video. The session was too short to capture any frames.")
+                placeholder("No timelapse was saved for this session.")
             }
         case .sticker:
             if let url = session.stickerURL, let image = UIImage(contentsOfFile: url.path) {
@@ -283,6 +306,62 @@ struct SessionDetailView: View {
             } else {
                 placeholder("No sticker yet")
             }
+        }
+    }
+
+    private func recoverSection(_ session: FocusSession) -> some View {
+        let leftovers = VideoTools.leftoverVideoFiles(in: Storage.folder(for: session.id))
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("No timelapse was saved for this session")
+                .font(.subheadline.weight(.semibold))
+            if leftovers.isEmpty {
+                Text("There are no video files left on the phone for it, so there's nothing to recover.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Found: " + leftovers.map { "\($0.lastPathComponent) (\(VideoTools.fileSizeText($0)))" }.joined(separator: ", "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    recover(session, files: leftovers)
+                } label: {
+                    HStack {
+                        if recovering { ProgressView() }
+                        Text(recovering ? "Recovering…" : "Try to recover video")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .disabled(recovering || rebuilding)
+            }
+            if let recoverMessage {
+                Text(recoverMessage)
+                    .font(.caption)
+                    .foregroundStyle(Theme.accent)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func recover(_ session: FocusSession, files: [URL]) {
+        recovering = true
+        recoverMessage = nil
+        Task {
+            let output = Storage.folder(for: session.id).appendingPathComponent("recovered.mov")
+            let result = await VideoTools.assemble(parts: files, into: output)
+            recovering = false
+            guard let url = result.url else {
+                recoverMessage = "Couldn't recover it: the file was never finished, so iPhone can't read it."
+                return
+            }
+            var updated = session
+            updated.rawVideoFile = url.lastPathComponent
+            updated.frameCount = result.frames
+            updated.recordingLog = (session.recordingLog ?? []) + result.log + ["Recovered \(result.frames) frames"]
+            store.upsert(updated)
+            recoverMessage = "Recovered \(result.frames) frames."
+            rebuild(updated, includeVideo: true)
         }
     }
 
